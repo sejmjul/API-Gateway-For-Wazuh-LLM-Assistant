@@ -14,7 +14,7 @@ from langchain_core.messages import (
     ToolMessage,
     convert_to_openai_messages,
 )
-from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
 from langfuse.langchain import CallbackHandler
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import (
@@ -54,13 +54,12 @@ class LangGraphAgent:
     def __init__(self):
         """Initialize the LangGraph Agent with necessary components."""
         # Use environment-specific LLM model
-        self.llm = ChatOpenAI(
+        self.llm = ChatOllama(
             model=settings.LLM_MODEL,
+            base_url=settings.LLM_BASE_URL,
             temperature=settings.DEFAULT_LLM_TEMPERATURE,
-            api_key=settings.LLM_API_KEY,
             max_tokens=settings.MAX_TOKENS,
-            **self._get_model_kwargs(),
-        ).bind_tools(tools)
+        )
         self.tools_by_name = {tool.name: tool for tool in tools}
         self._connection_pool: Optional[AsyncConnectionPool] = None
         self._graph: Optional[CompiledStateGraph] = None

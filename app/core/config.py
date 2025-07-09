@@ -149,7 +149,10 @@ class Settings:
 
         # LangGraph Configuration
         self.LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-        self.LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+        #self.LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini") # this was here
+        # Ollama
+        self.LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
+        self.LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
         self.DEFAULT_LLM_TEMPERATURE = float(os.getenv("DEFAULT_LLM_TEMPERATURE", "0.2"))
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
