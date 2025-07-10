@@ -130,6 +130,9 @@ class Settings:
         # Set the environment
         self.ENVIRONMENT = get_environment()
 
+        # API KEY FOR TESTING! DELETE LATER
+        self.API_KEY = os.getenv("API_KEY", "NO API KEY IN ENV")
+
         # Application Settings
         self.PROJECT_NAME = os.getenv("PROJECT_NAME", "FastAPI LangGraph Template")
         self.VERSION = os.getenv("VERSION", "1.0.0")
@@ -148,11 +151,12 @@ class Settings:
         self.LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
 
         # LangGraph Configuration
-        self.LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-        #self.LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini") # this was here
-        # Ollama
-        self.LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
+        self.MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "ollama").lower()
+        self.LLM_OLLAMA_MODEL = os.getenv("LLM_OLLAMA_MODEL", "llama3")
+        self.LLM_OPENAI_MODEL = os.getenv("LLM_OPENAI_MODEL", "gpt-4o-mini")
         self.LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
+        self.OPENAI_API_KEY = os.getenv("LLM_API_KEY", "")
+        self.OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
         self.DEFAULT_LLM_TEMPERATURE = float(os.getenv("DEFAULT_LLM_TEMPERATURE", "0.2"))
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
@@ -198,7 +202,7 @@ class Settings:
         # Evaluation Configuration
         self.EVALUATION_LLM = os.getenv("EVALUATION_LLM", "gpt-4o-mini")
         self.EVALUATION_BASE_URL = os.getenv("EVALUATION_BASE_URL", "https://api.openai.com/v1")
-        self.EVALUATION_API_KEY = os.getenv("EVALUATION_API_KEY", self.LLM_API_KEY)
+        self.EVALUATION_API_KEY = os.getenv("EVALUATION_API_KEY", self.OPENAI_API_KEY)
         self.EVALUATION_SLEEP_TIME = int(os.getenv("EVALUATION_SLEEP_TIME", "10"))
 
         # Apply environment-specific settings
@@ -240,6 +244,15 @@ class Settings:
             # Only override if environment variable wasn't explicitly set
             if env_var_name not in os.environ:
                 setattr(self, key, value)
+
+    @property
+    def llm_model(self):
+        if self.MODEL_PROVIDER == "ollama":
+            return self.LLM_OLLAMA_MODEL
+        elif self.MODEL_PROVIDER == "openai":
+            return self.LLM_OPENAI_MODEL
+        else:
+            raise ValueError(f"Unsupported MODEL_PROVIDER: {self.MODEL_PROVIDER}")
 
 
 # Create settings instance

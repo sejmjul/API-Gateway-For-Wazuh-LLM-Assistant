@@ -227,6 +227,39 @@ async def login(
         raise HTTPException(status_code=422, detail=str(ve))
 
 
+@router.post("/login/apikey", response_model=TokenResponse)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["login"][0])
+async def login_with_apikey(
+    request: Request,
+    api_key: str = Form(...),
+):
+    """
+    Login using API key.
+    """
+    try:
+        sanitized_api_key = sanitize_string(api_key)
+        if sanitized_api_key != settings.API_KEY:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        # For now, you can use a test user or a special user id
+        user = await db_service.get_user_by_email("test@apikey.local")
+        if not user:
+            # Optionally, create a test user if not exists
+            user = await db_service.create_user(email="test@apikey.local", password=User.hash_password("dummy"))
+        token = create_access_token(str(user.id))
+        return TokenResponse(
+            access_token=token.access_token,
+            token_type="bearer",
+            expires_at=token.expires_at,
+        )
+    except ValueError as ve:
+        logger.error("login_apikey_validation_failed", error=str(ve), exc_info=True)
+        raise HTTPException(status_code=422, detail=str(ve))
+
+
 @router.post("/session", response_model=SessionResponse)
 async def create_session(user: User = Depends(get_current_user)):
     """Create a new chat session for the authenticated user.

@@ -15,6 +15,7 @@ from langchain_core.messages import (
     convert_to_openai_messages,
 )
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langfuse.langchain import CallbackHandler
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import (
@@ -53,18 +54,32 @@ class LangGraphAgent:
 
     def __init__(self):
         """Initialize the LangGraph Agent with necessary components."""
-        # Use environment-specific LLM model
-        self.llm = ChatOllama(
-            model=settings.LLM_MODEL,
-            base_url=settings.LLM_BASE_URL,
-            temperature=settings.DEFAULT_LLM_TEMPERATURE,
-            max_tokens=settings.MAX_TOKENS,
-        )
+        provider = settings.MODEL_PROVIDER
+        if provider == "ollama":
+            self.llm = ChatOllama(
+                model=settings.llm_model,
+                base_url=settings.LLM_BASE_URL,
+                temperature=settings.DEFAULT_LLM_TEMPERATURE,
+                max_tokens=settings.MAX_TOKENS,
+            )
+            self.model_name = settings.llm_model
+        elif provider == "openai":
+            self.llm = ChatOpenAI(
+                model=settings.llm_model,
+                api_key=settings.OPENAI_API_KEY,
+                base_url=settings.OPENAI_BASE_URL,
+                temperature=settings.DEFAULT_LLM_TEMPERATURE,
+                max_tokens=settings.MAX_TOKENS,
+            )
+            self.model_name = settings.llm_model
+        else:
+            raise ValueError(f"Unsupported MODEL_PROVIDER: {provider}")
+
         self.tools_by_name = {tool.name: tool for tool in tools}
         self._connection_pool: Optional[AsyncConnectionPool] = None
         self._graph: Optional[CompiledStateGraph] = None
 
-        logger.info("llm_initialized", model=settings.LLM_MODEL, environment=settings.ENVIRONMENT.value)
+        logger.info("llm_initialized", model=self.model_name, provider=provider, environment=settings.ENVIRONMENT.value)
 
     def _get_model_kwargs(self) -> Dict[str, Any]:
         """Get environment-specific model kwargs.
@@ -136,13 +151,14 @@ class LangGraphAgent:
 
         for attempt in range(max_retries):
             try:
-                with llm_inference_duration_seconds.labels(model=self.llm.model_name).time():
+                # Use self.model_name instead of self.llm.model_name
+                with llm_inference_duration_seconds.labels(model=self.model_name).time():
                     generated_state = {"messages": [await self.llm.ainvoke(dump_messages(messages))]}
                 logger.info(
                     "llm_response_generated",
                     session_id=state.session_id,
                     llm_calls_num=llm_calls_num + 1,
-                    model=settings.LLM_MODEL,
+                    model=settings.llm_model,
                     environment=settings.ENVIRONMENT.value,
                 )
                 return generated_state
@@ -163,7 +179,16 @@ class LangGraphAgent:
                     logger.warning(
                         "using_fallback_model", model=fallback_model, environment=settings.ENVIRONMENT.value
                     )
-                    self.llm.model_name = fallback_model
+                    # Update the model_name attribute instead of trying to set it on llm
+                    self.model_name = fallback_model
+                    # You may need to recreate the LLM here if you need to actually use the fallback model
+                    self.llm = ChatOpenAI(
+                        model=fallback_model,
+                        api_key=settings.OPENAI_API_KEY,
+                        base_url=settings.OPENAI_BASE_URL,
+                        temperature=settings.DEFAULT_LLM_TEMPERATURE,
+                        max_tokens=settings.MAX_TOKENS,
+                    )
 
                 continue
 
@@ -312,11 +337,14 @@ class LangGraphAgent:
         """
         config = {
             "configurable": {"thread_id": session_id},
-            "callbacks": [
-                CallbackHandler(
-                    environment=settings.ENVIRONMENT.value, debug=False, user_id=user_id, session_id=session_id
-                )
-            ],
+            # "callbacks": [
+            #     CallbackHandler(
+            #         environment=settings.ENVIRONMENT.value, debug=False, user_id=user_id, session_id=session_id
+            #     )
+            # ],
+                "callbacks": [
+                    CallbackHandler()
+                ],
         }
         if self._graph is None:
             self._graph = await self.create_graph()

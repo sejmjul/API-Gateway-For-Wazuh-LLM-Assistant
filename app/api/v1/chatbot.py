@@ -12,15 +12,14 @@ from fastapi import (
     Depends,
     HTTPException,
     Request,
+    Header,
 )
 from fastapi.responses import StreamingResponse
 from app.core.metrics import llm_stream_duration_seconds
-from app.api.v1.auth import get_current_session
 from app.core.config import settings
 from app.core.langgraph.graph import LangGraphAgent
 from app.core.limiter import limiter
 from app.core.logging import logger
-from app.models.session import Session
 from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
@@ -31,6 +30,10 @@ from app.schemas.chat import (
 router = APIRouter()
 agent = LangGraphAgent()
 
+async def require_api_key(x_api_key: str = Header(..., alias="X-API-KEY")):
+    if x_api_key != settings.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return True
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -38,14 +41,14 @@ agent = LangGraphAgent()
 async def chat(
     request: Request,
     chat_request: ChatRequest,
-    session: Session = Depends(get_current_session),
+    authorized: bool = Depends(require_api_key),
 ):
     """Process a chat request using LangGraph.
 
     Args:
         request: The FastAPI request object for rate limiting.
         chat_request: The chat request containing messages.
-        session: The current session from the auth token.
+        authorized: Whether the request is authorized via API key.
 
     Returns:
         ChatResponse: The processed chat response.
@@ -54,23 +57,25 @@ async def chat(
         HTTPException: If there's an error processing the request.
     """
     try:
+        # Use static session ID and user ID for API key auth
+        session_id = "wazuh-api"
+        user_id = "wazuh-api"
+        
         logger.info(
             "chat_request_received",
-            session_id=session.id,
+            session_id=session_id,
             message_count=len(chat_request.messages),
         )
 
-       
-
         result = await agent.get_response(
-            chat_request.messages, session.id, user_id=session.user_id
+            chat_request.messages, session_id, user_id=user_id
         )
 
-        logger.info("chat_request_processed", session_id=session.id)
+        logger.info("chat_request_processed", session_id=session_id)
 
         return ChatResponse(messages=result)
     except Exception as e:
-        logger.error("chat_request_failed", session_id=session.id, error=str(e), exc_info=True)
+        logger.error("chat_request_failed", session_id="wazuh-api", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -79,14 +84,14 @@ async def chat(
 async def chat_stream(
     request: Request,
     chat_request: ChatRequest,
-    session: Session = Depends(get_current_session),
+    authorized: bool = Depends(require_api_key),
 ):
     """Process a chat request using LangGraph with streaming response.
 
     Args:
         request: The FastAPI request object for rate limiting.
         chat_request: The chat request containing messages.
-        session: The current session from the auth token.
+        authorized: Whether the request is authorized via API key.
 
     Returns:
         StreamingResponse: A streaming response of the chat completion.
@@ -95,26 +100,23 @@ async def chat_stream(
         HTTPException: If there's an error processing the request.
     """
     try:
+        # Use static session ID and user ID for API key auth
+        session_id = "wazuh-api"
+        user_id = "wazuh-api"
+        
         logger.info(
             "stream_chat_request_received",
-            session_id=session.id,
+            session_id=session_id,
             message_count=len(chat_request.messages),
         )
 
         async def event_generator():
-            """Generate streaming events.
-
-            Yields:
-                str: Server-sent events in JSON format.
-
-            Raises:
-                Exception: If there's an error during streaming.
-            """
+            """Generate streaming events."""
             try:
                 full_response = ""
-                with llm_stream_duration_seconds.labels(model=agent.llm.model_name).time():
+                with llm_stream_duration_seconds.labels(model=agent.model_name).time():
                     async for chunk in agent.get_stream_response(
-                        chat_request.messages, session.id, user_id=session.user_id
+                        chat_request.messages, session_id, user_id=user_id
                      ):
                         full_response += chunk
                         response = StreamResponse(content=chunk, done=False)
@@ -127,7 +129,7 @@ async def chat_stream(
             except Exception as e:
                 logger.error(
                     "stream_chat_request_failed",
-                    session_id=session.id,
+                    session_id=session_id,
                     error=str(e),
                     exc_info=True,
                 )
@@ -139,36 +141,30 @@ async def chat_stream(
     except Exception as e:
         logger.error(
             "stream_chat_request_failed",
-            session_id=session.id,
+            session_id="wazuh-api",
             error=str(e),
             exc_info=True,
         )
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Keep the session-based endpoints if needed, or remove if not
 @router.get("/messages", response_model=ChatResponse)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])
 async def get_session_messages(
     request: Request,
-    session: Session = Depends(get_current_session),
+    x_api_key: str = Header(..., alias="X-API-KEY"),
 ):
-    """Get all messages for a session.
-
-    Args:
-        request: The FastAPI request object for rate limiting.
-        session: The current session from the auth token.
-
-    Returns:
-        ChatResponse: All messages in the session.
-
-    Raises:
-        HTTPException: If there's an error retrieving the messages.
-    """
+    """Get all messages for a session."""
+    if x_api_key != settings.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
     try:
-        messages = await agent.get_chat_history(session.id)
+        session_id = "wazuh-api"
+        messages = await agent.get_chat_history(session_id)
         return ChatResponse(messages=messages)
     except Exception as e:
-        logger.error("get_messages_failed", session_id=session.id, error=str(e), exc_info=True)
+        logger.error("get_messages_failed", session_id="wazuh-api", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -176,20 +172,13 @@ async def get_session_messages(
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])
 async def clear_chat_history(
     request: Request,
-    session: Session = Depends(get_current_session),
+    authorized: bool = Depends(require_api_key),
 ):
-    """Clear all messages for a session.
-
-    Args:
-        request: The FastAPI request object for rate limiting.
-        session: The current session from the auth token.
-
-    Returns:
-        dict: A message indicating the chat history was cleared.
-    """
+    """Clear all messages for a session."""
     try:
-        await agent.clear_chat_history(session.id)
+        session_id = "wazuh-api"
+        await agent.clear_chat_history(session_id)
         return {"message": "Chat history cleared successfully"}
     except Exception as e:
-        logger.error("clear_chat_history_failed", session_id=session.id, error=str(e), exc_info=True)
+        logger.error("clear_chat_history_failed", session_id="wazuh-api", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

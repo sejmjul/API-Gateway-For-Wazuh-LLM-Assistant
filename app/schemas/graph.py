@@ -43,3 +43,26 @@ class GraphState(BaseModel):
             if not re.match(r"^[a-zA-Z0-9_\-]+$", v):
                 raise ValueError("Session ID must contain only alphanumeric characters, underscores, and hyphens")
             return v
+
+
+class LangGraphAgent:
+    def __init__(self):
+        provider = settings.MODEL_PROVIDER
+        if provider == "ollama":
+            self.llm = ChatOllama(
+                model=settings.llm_model,
+                base_url=settings.LLM_BASE_URL,
+                temperature=settings.DEFAULT_LLM_TEMPERATURE,
+                max_tokens=settings.MAX_TOKENS,
+            )
+        elif provider == "openai":
+            self.llm = ChatOpenAI(
+                model=settings.llm_model,
+                api_key=settings.OPENAI_API_KEY,
+                base_url=settings.OPENAI_BASE_URL,
+                temperature=settings.DEFAULT_LLM_TEMPERATURE,
+                max_tokens=settings.MAX_TOKENS,
+            )
+        else:
+            raise ValueError(f"Unsupported MODEL_PROVIDER: {provider}")
+        self.model_name = settings.llm_model
