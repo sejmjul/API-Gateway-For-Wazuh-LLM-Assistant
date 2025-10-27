@@ -5,7 +5,7 @@ streaming chat, message history management, and chat history clearing.
 """
 
 import json
-from typing import List
+from typing import List, AsyncGenerator
 
 from fastapi import (
     APIRouter,
@@ -44,38 +44,51 @@ async def chat(
     authorized: bool = Depends(require_api_key),
 ):
     """Process a chat request using LangGraph.
-
-    Args:
-        request: The FastAPI request object for rate limiting.
-        chat_request: The chat request containing messages.
-        authorized: Whether the request is authorized via API key.
-
-    Returns:
-        ChatResponse: The processed chat response.
-
-    Raises:
-        HTTPException: If there's an error processing the request.
+    
+    Uses stateless processing - each request is handled independently
+    without retrieving or storing conversation history in the database.
+    This is optimal for Wazuh integration where each request contains
+    the full conversation context.
     """
     try:
-        # Use static session ID and user ID for API key auth
-        session_id = "wazuh-api"
-        user_id = "wazuh-api"
-        
+        # Extract the latest user message for logging
+        user_message = ""
+        if chat_request.messages and len(chat_request.messages) > 0:
+            last_message = chat_request.messages[-1]
+            if last_message.role == "user":
+                user_message = last_message.content
+
+        # Log request with user message
         logger.info(
             "chat_request_received",
-            session_id=session_id,
             message_count=len(chat_request.messages),
+            user_message=user_message,
         )
 
-        result = await agent.get_response(
-            chat_request.messages, session_id, user_id=user_id
-        )
+        # Print user message to console for easier development/debugging
+        print(f"\n{'-'*50}\n💬 User: {user_message}\n{'-'*50}")
 
-        logger.info("chat_request_processed", session_id=session_id)
+        # Use stateless processing - no database dependency
+        result = await agent.get_stateless_response(chat_request.messages)
+
+        # Log response content
+        response_content = ""
+        if result and len(result) > 0:
+            # Access as attribute instead of using .get()
+            content = result[0].content if hasattr(result[0], 'content') else ""
+            response_content = content[:100] + "..." if len(content) > 100 else content
+        
+        logger.info(
+            "chat_request_processed",
+            response_preview=response_content
+        )
+        
+        # Print assistant response to console
+        print(f"\n🤖 Assistant: {response_content}\n{'-'*50}")
 
         return ChatResponse(messages=result)
     except Exception as e:
-        logger.error("chat_request_failed", session_id="wazuh-api", error=str(e), exc_info=True)
+        logger.error("chat_request_failed", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -86,41 +99,49 @@ async def chat_stream(
     chat_request: ChatRequest,
     authorized: bool = Depends(require_api_key),
 ):
-    """Process a chat request using LangGraph with streaming response.
-
-    Args:
-        request: The FastAPI request object for rate limiting.
-        chat_request: The chat request containing messages.
-        authorized: Whether the request is authorized via API key.
-
-    Returns:
-        StreamingResponse: A streaming response of the chat completion.
-
-    Raises:
-        HTTPException: If there's an error processing the request.
+    """Process a streaming chat request using LangGraph.
+    
+    Uses stateless processing - each request is handled independently
+    without retrieving or storing conversation history in the database.
     """
     try:
-        # Use static session ID and user ID for API key auth
-        session_id = "wazuh-api"
-        user_id = "wazuh-api"
+        # Extract the latest user message for logging
+        user_message = ""
+        if chat_request.messages and len(chat_request.messages) > 0:
+            last_message = chat_request.messages[-1]
+            if last_message.role == "user":
+                user_message = last_message.content
         
+        # Log request with user message
         logger.info(
             "stream_chat_request_received",
-            session_id=session_id,
             message_count=len(chat_request.messages),
+            user_message=user_message,
         )
+
+        # Print user message to console for easier development/debugging
+        print(f"\n{'-'*50}\n💬 User (Stream): {user_message}\n{'-'*50}")
 
         async def event_generator():
             """Generate streaming events."""
             try:
                 full_response = ""
                 with llm_stream_duration_seconds.labels(model=agent.model_name).time():
-                    async for chunk in agent.get_stream_response(
-                        chat_request.messages, session_id, user_id=user_id
-                     ):
+                    # Use stateless streaming - no database dependency
+                    async for chunk in agent.get_stateless_stream_response(chat_request.messages):
                         full_response += chunk
                         response = StreamResponse(content=chunk, done=False)
                         yield f"data: {json.dumps(response.model_dump())}\n\n"
+
+                # Print assistant response to console
+                print(f"\n🤖 Assistant (Stream): {full_response[:100]}...\n{'-'*50}")
+                
+                # Log response summary
+                logger.info(
+                    "stream_chat_completed",
+                    response_length=len(full_response),
+                    response_preview=full_response[:100] + "..." if len(full_response) > 100 else full_response
+                )
 
                 # Send final message indicating completion
                 final_response = StreamResponse(content="", done=True)
@@ -129,7 +150,6 @@ async def chat_stream(
             except Exception as e:
                 logger.error(
                     "stream_chat_request_failed",
-                    session_id=session_id,
                     error=str(e),
                     exc_info=True,
                 )
@@ -139,46 +159,90 @@ async def chat_stream(
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     except Exception as e:
-        logger.error(
-            "stream_chat_request_failed",
-            session_id="wazuh-api",
-            error=str(e),
-            exc_info=True,
-        )
+        logger.error("stream_chat_request_failed", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Keep the session-based endpoints if needed, or remove if not
-@router.get("/messages", response_model=ChatResponse)
-@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])
-async def get_session_messages(
+@router.post("/opensearch", response_model=ChatResponse)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["chat"][0])
+async def opensearch_chat(
     request: Request,
-    x_api_key: str = Header(..., alias="X-API-KEY"),
+    chat_request: ChatRequest,
+    authorized: bool = Depends(require_api_key),
 ):
-    """Get all messages for a session."""
-    if x_api_key != settings.API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+    """Process a chat request specifically for OpenSearch integration.
     
+    Returns a simplified response without the thinking process or JSON formatting.
+    """
     try:
-        session_id = "wazuh-api"
-        messages = await agent.get_chat_history(session_id)
-        return ChatResponse(messages=messages)
+        # Extract the user message
+        user_message = ""
+        if chat_request.messages and len(chat_request.messages) > 0:
+            last_message = chat_request.messages[-1]
+            if last_message.role == "user":
+                user_message = last_message.content
+
+        # Log request
+        logger.info(
+            "opensearch_request_received",
+            message_count=len(chat_request.messages),
+            user_message=user_message,
+        )
+
+        # Get stateless response
+        result = await agent.get_stateless_response(chat_request.messages)
+        
+        # Process the response to extract only the final answer
+        clean_response = ""
+        if result and len(result) > 0:
+            content = result[0].content if hasattr(result[0], 'content') else ""
+            
+            # Try to extract just the final answer from JSON format
+            import re
+            import json
+            
+            # Look for JSON blocks in the response
+            json_pattern = r'```json\s*(.*?)\s*```'
+            json_matches = re.findall(json_pattern, content, re.DOTALL)
+            
+            if json_matches:
+                try:
+                    json_obj = json.loads(json_matches[0])
+                    if "final_answer" in json_obj:
+                        clean_response = json_obj["final_answer"]
+                    else:
+                        # For tool usage responses, give a helpful message
+                        clean_response = "I need to gather more information to answer your question completely."
+                except:
+                    clean_response = content
+            else:
+                clean_response = content
+        
+        # If we couldn't extract a clean response, use the original
+        if not clean_response:
+            clean_response = content
+            
+        # Create a new message with the clean response
+        clean_message = Message(role="assistant", content=clean_response)
+        
+        return ChatResponse(messages=[clean_message])
     except Exception as e:
-        logger.error("get_messages_failed", session_id="wazuh-api", error=str(e), exc_info=True)
+        logger.error("opensearch_request_failed", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.delete("/messages")
+# Simple endpoint to clear the database cache if needed
+@router.delete("/cache")
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])
-async def clear_chat_history(
+async def clear_chat_cache(
     request: Request,
     authorized: bool = Depends(require_api_key),
 ):
-    """Clear all messages for a session."""
+    """Clear any cached chat history from the database."""
     try:
         session_id = "wazuh-api"
         await agent.clear_chat_history(session_id)
-        return {"message": "Chat history cleared successfully"}
+        return {"message": "Chat cache cleared successfully"}
     except Exception as e:
-        logger.error("clear_chat_history_failed", session_id="wazuh-api", error=str(e), exc_info=True)
+        logger.error("clear_cache_failed", error=str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

@@ -1,5 +1,7 @@
 """This file contains the LangGraph Agent/workflow and interactions with the LLM."""
 
+
+import uuid
 from typing import (
     Any,
     AsyncGenerator,
@@ -337,14 +339,12 @@ class LangGraphAgent:
         """
         config = {
             "configurable": {"thread_id": session_id},
-            # "callbacks": [
-            #     CallbackHandler(
-            #         environment=settings.ENVIRONMENT.value, debug=False, user_id=user_id, session_id=session_id
-            #     )
-            # ],
-                "callbacks": [
-                    CallbackHandler()
-                ],
+            "callbacks": [
+                CallbackHandler(
+                    environment=settings.ENVIRONMENT.value, debug=False, user_id=user_id, session_id=session_id
+                )
+            ],
+
         }
         if self._graph is None:
             self._graph = await self.create_graph()
@@ -415,3 +415,60 @@ class LangGraphAgent:
         except Exception as e:
             logger.error("Failed to clear chat history", error=str(e))
             raise
+
+    async def get_stateless_response(
+        self,
+        messages: list[Message],
+        session_id: Optional[str] = None,
+    ) -> list[dict]:
+        """Get a response from the LLM without using database history.
+        
+        This stateless version doesn't use checkpointing or persistent state,
+        making it ideal for API integrations like OpenSearch where each
+        request should be handled independently.
+        
+        Args:
+            messages (list[Message]): The messages to send to the LLM.
+            session_id (Optional[str]): Optional session ID for tracking only.
+            
+        Returns:
+            list[dict]: The response from the LLM.
+        """
+        # Create a temporary graph for just this request
+        graph_builder = StateGraph(GraphState)
+        graph_builder.add_node("chat", self._chat)
+        graph_builder.add_node("tool_call", self._tool_call)
+        graph_builder.add_conditional_edges(
+            "chat",
+            self._should_continue,
+            {"continue": "tool_call", "end": END},
+        )
+        graph_builder.add_edge("tool_call", "chat")
+        graph_builder.set_entry_point("chat")
+        graph_builder.set_finish_point("chat")
+        
+        # Don't use a checkpointer (no database persistence)
+        graph = graph_builder.compile(
+            checkpointer=None, 
+            name="Stateless Agent"
+        )
+        
+        # Generate a unique session ID if not provided
+        if not session_id:
+            session_id = f"stateless-{uuid.uuid4()}"
+        
+        # Configure without callbacks or checkpointing
+        config = {
+            "configurable": {"thread_id": session_id},
+            "callbacks": [],  # No callbacks for stateless operation
+        }
+        
+        try:
+            response = await graph.ainvoke(
+                {"messages": dump_messages(messages), "session_id": session_id}, 
+                config
+            )
+            return self.__process_messages(response["messages"])
+        except Exception as e:
+            logger.error(f"Error in stateless response: {str(e)}", session_id=session_id)
+            raise e
