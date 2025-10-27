@@ -49,9 +49,6 @@ class DatabaseService:
                 pool_recycle=1800,  # Recycle connections after 30 minutes
             )
 
-            # Create tables (only if they don't exist)
-            SQLModel.metadata.create_all(self.engine)
-
             logger.info(
                 "database_initialized",
                 environment=settings.ENVIRONMENT.value,

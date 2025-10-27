@@ -48,14 +48,15 @@ from app.utils import (
 
 
 class LangGraphAgent:
-    """Manages the LangGraph Agent/workflow and interactions with the LLM.
-
-    This class handles the creation and management of the LangGraph workflow,
-    including LLM interactions, database connections, and response processing.
+    """Stateless LangGraph Agent for Wazuh integration.
+    
+    This agent processes each request independently. The client (Wazuh)
+    sends the full conversation history with each request, so no database
+    persistence is needed. Langfuse is used solely for observability.
     """
 
     def __init__(self):
-        """Initialize the LangGraph Agent with necessary components."""
+        """Initialize the LangGraph Agent with LLM only - no database."""
         provider = settings.MODEL_PROVIDER
         if provider == "ollama":
             self.llm = ChatOllama(
@@ -78,62 +79,40 @@ class LangGraphAgent:
             raise ValueError(f"Unsupported MODEL_PROVIDER: {provider}")
 
         self.tools_by_name = {tool.name: tool for tool in tools}
-        self._connection_pool: Optional[AsyncConnectionPool] = None
-        self._graph: Optional[CompiledStateGraph] = None
+        # Bind tools to LLM
+        self.llm = self.llm.bind_tools(tools)
+        
+        # Create stateless graph immediately
+        self._graph = self._create_stateless_graph()
+        
+        logger.info(
+            "llm_initialized",
+            model_name=self.model_name,
+            provider=provider,
+            has_tools=len(self.tools_by_name),
+            mode="stateless"
+        )
 
-        logger.info("llm_initialized", model=self.model_name, provider=provider, environment=settings.ENVIRONMENT.value)
-
-    def _get_model_kwargs(self) -> Dict[str, Any]:
-        """Get environment-specific model kwargs.
-
+    def _create_stateless_graph(self) -> CompiledStateGraph:
+        """Create a stateless graph with no checkpointing.
+        
         Returns:
-            Dict[str, Any]: Additional model arguments based on environment
+            CompiledStateGraph: The compiled graph ready for use.
         """
-        model_kwargs = {}
-
-        # Development - we can use lower speeds for cost savings
-        if settings.ENVIRONMENT == Environment.DEVELOPMENT:
-            model_kwargs["top_p"] = 0.8
-
-        # Production - use higher quality settings
-        elif settings.ENVIRONMENT == Environment.PRODUCTION:
-            model_kwargs["top_p"] = 0.95
-            model_kwargs["presence_penalty"] = 0.1
-            model_kwargs["frequency_penalty"] = 0.1
-
-        return model_kwargs
-
-    async def _get_connection_pool(self) -> AsyncConnectionPool:
-        """Get a PostgreSQL connection pool using environment-specific settings.
-
-        Returns:
-            AsyncConnectionPool: A connection pool for PostgreSQL database.
-        """
-        if self._connection_pool is None:
-            try:
-                # Configure pool size based on environment
-                max_size = settings.POSTGRES_POOL_SIZE
-
-                self._connection_pool = AsyncConnectionPool(
-                    settings.POSTGRES_URL,
-                    open=False,
-                    max_size=max_size,
-                    kwargs={
-                        "autocommit": True,
-                        "connect_timeout": 5,
-                        "prepare_threshold": None,
-                    },
-                )
-                await self._connection_pool.open()
-                logger.info("connection_pool_created", max_size=max_size, environment=settings.ENVIRONMENT.value)
-            except Exception as e:
-                logger.error("connection_pool_creation_failed", error=str(e), environment=settings.ENVIRONMENT.value)
-                # In production, we might want to degrade gracefully
-                if settings.ENVIRONMENT == Environment.PRODUCTION:
-                    logger.warning("continuing_without_connection_pool", environment=settings.ENVIRONMENT.value)
-                    return None
-                raise e
-        return self._connection_pool
+        graph_builder = StateGraph(GraphState)
+        graph_builder.add_node("chat", self._chat)
+        graph_builder.add_node("tool_call", self._tool_call)
+        graph_builder.add_conditional_edges(
+            "chat",
+            self._should_continue,
+            {"continue": "tool_call", "end": END},
+        )
+        graph_builder.add_edge("tool_call", "chat")
+        graph_builder.set_entry_point("chat")
+        graph_builder.set_finish_point("chat")
+        
+        # No checkpointer - pure stateless operation
+        return graph_builder.compile(name=f"{settings.PROJECT_NAME} Stateless Agent")
 
     async def _chat(self, state: GraphState) -> dict:
         """Process the chat state and generate a response.
@@ -236,239 +215,111 @@ class LangGraphAgent:
         else:
             return "continue"
 
-    async def create_graph(self) -> Optional[CompiledStateGraph]:
-        """Create and configure the LangGraph workflow.
-
-        Returns:
-            Optional[CompiledStateGraph]: The configured LangGraph instance or None if init fails
-        """
-        if self._graph is None:
-            try:
-                graph_builder = StateGraph(GraphState)
-                graph_builder.add_node("chat", self._chat)
-                graph_builder.add_node("tool_call", self._tool_call)
-                graph_builder.add_conditional_edges(
-                    "chat",
-                    self._should_continue,
-                    {"continue": "tool_call", "end": END},
-                )
-                graph_builder.add_edge("tool_call", "chat")
-                graph_builder.set_entry_point("chat")
-                graph_builder.set_finish_point("chat")
-
-                # Get connection pool (may be None in production if DB unavailable)
-                connection_pool = await self._get_connection_pool()
-                if connection_pool:
-                    checkpointer = AsyncPostgresSaver(connection_pool)
-                    await checkpointer.setup()
-                else:
-                    # In production, proceed without checkpointer if needed
-                    checkpointer = None
-                    if settings.ENVIRONMENT != Environment.PRODUCTION:
-                        raise Exception("Connection pool initialization failed")
-
-                self._graph = graph_builder.compile(
-                    checkpointer=checkpointer, name=f"{settings.PROJECT_NAME} Agent ({settings.ENVIRONMENT.value})"
-                )
-
-                logger.info(
-                    "graph_created",
-                    graph_name=f"{settings.PROJECT_NAME} Agent",
-                    environment=settings.ENVIRONMENT.value,
-                    has_checkpointer=checkpointer is not None,
-                )
-            except Exception as e:
-                logger.error("graph_creation_failed", error=str(e), environment=settings.ENVIRONMENT.value)
-                # In production, we don't want to crash the app
-                if settings.ENVIRONMENT == Environment.PRODUCTION:
-                    logger.warning("continuing_without_graph")
-                    return None
-                raise e
-
-        return self._graph
-
     async def get_response(
         self,
         messages: list[Message],
-        session_id: str,
+        session_id: Optional[str] = None,
         user_id: Optional[str] = None,
     ) -> list[dict]:
-        """Get a response from the LLM.
-
+        """Get a response from the LLM (stateless).
+        
         Args:
-            messages (list[Message]): The messages to send to the LLM.
-            session_id (str): The session ID for Langfuse tracking.
-            user_id (Optional[str]): The user ID for Langfuse tracking.
-
+            messages: The full conversation history from the client.
+            session_id: Optional ID for Langfuse tracking only.
+            user_id: Optional user ID for Langfuse tracking only.
+            
         Returns:
-            list[dict]: The response from the LLM.
+            list[dict]: The assistant's response messages.
         """
-        if self._graph is None:
-            self._graph = await self.create_graph()
-        config = {
-            "configurable": {"thread_id": session_id},
-            "callbacks": [CallbackHandler()],
-            "metadata": {
-                "user_id": user_id,
-                "session_id": session_id,
-                "environment": settings.ENVIRONMENT.value,
-                "debug": False,
-            },
-        }
-        try:
-            response = await self._graph.ainvoke(
-                {"messages": dump_messages(messages), "session_id": session_id}, config
-            )
-            return self.__process_messages(response["messages"])
-        except Exception as e:
-            logger.error(f"Error getting response: {str(e)}")
-            raise e
-
-    async def get_stream_response(
-        self, messages: list[Message], session_id: str, user_id: Optional[str] = None
-    ) -> AsyncGenerator[str, None]:
-        """Get a stream response from the LLM.
-
-        Args:
-            messages (list[Message]): The messages to send to the LLM.
-            session_id (str): The session ID for the conversation.
-            user_id (Optional[str]): The user ID for the conversation.
-
-        Yields:
-            str: Tokens of the LLM response.
-        """
+        # Generate session ID if not provided (for Langfuse tracking)
+        if not session_id:
+            session_id = f"wazuh-{uuid.uuid4()}"
+        
         config = {
             "configurable": {"thread_id": session_id},
             "callbacks": [
-                CallbackHandler(
-                    environment=settings.ENVIRONMENT.value, debug=False, user_id=user_id, session_id=session_id
-                )
+                CallbackHandler()  # No parameters needed - uses environment variables
             ],
-
+            "metadata": {
+                "user_id": user_id or "anonymous",
+                "session_id": session_id,
+                "environment": settings.ENVIRONMENT.value,
+            },
+            "tags": [settings.ENVIRONMENT.value, "wazuh"],
         }
-        if self._graph is None:
-            self._graph = await self.create_graph()
+        
+        try:
+            response = await self._graph.ainvoke(
+                {"messages": dump_messages(messages), "session_id": session_id},
+                config
+            )
+            
+            logger.info(
+                "response_generated",
+                session_id=session_id,
+                message_count=len(response.get("messages", [])),
+            )
+            
+            return self.__process_messages(response["messages"])
+            
+        except Exception as e:
+            logger.error("response_generation_failed", error=str(e), session_id=session_id, exc_info=True)
+            raise e
 
+    async def get_stream_response(
+        self,
+        messages: list[Message],
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Get a streaming response from the LLM (stateless).
+        
+        Args:
+            messages: The full conversation history from the client.
+            session_id: Optional ID for Langfuse tracking only.
+            user_id: Optional user ID for Langfuse tracking only.
+            
+        Yields:
+            str: Tokens of the LLM response.
+        """
+        # Generate session ID if not provided
+        if not session_id:
+            session_id = f"wazuh-{uuid.uuid4()}"
+        
+        config = {
+            "configurable": {"thread_id": session_id},
+            "callbacks": [
+                CallbackHandler()  # No parameters needed
+            ],
+            "metadata": {
+                "user_id": user_id or "anonymous", 
+                "session_id": session_id,
+                "environment": settings.ENVIRONMENT.value,
+            },
+            "tags": [settings.ENVIRONMENT.value, "wazuh"],
+        }
+        
         try:
             async for token, _ in self._graph.astream(
-                {"messages": dump_messages(messages), "session_id": session_id}, config, stream_mode="messages"
+                {"messages": dump_messages(messages), "session_id": session_id},
+                config,
+                stream_mode="messages"
             ):
                 try:
-                    yield token.content
-                except Exception as token_error:
-                    logger.error("Error processing token", error=str(token_error), session_id=session_id)
-                    # Continue with next token even if current one fails
-                    continue
-        except Exception as stream_error:
-            logger.error("Error in stream processing", error=str(stream_error), session_id=session_id)
-            raise stream_error
-
-    async def get_chat_history(self, session_id: str) -> list[Message]:
-        """Get the chat history for a given thread ID.
-
-        Args:
-            session_id (str): The session ID for the conversation.
-
-        Returns:
-            list[Message]: The chat history.
-        """
-        if self._graph is None:
-            self._graph = await self.create_graph()
-
-        state: StateSnapshot = await sync_to_async(self._graph.get_state)(
-            config={"configurable": {"thread_id": session_id}}
-        )
-        return self.__process_messages(state.values["messages"]) if state.values else []
+                    if hasattr(token, "content") and token.content:
+                        yield token.content
+                except (StopIteration, GeneratorExit):
+                    break
+                    
+        except Exception as e:
+            logger.error("stream_response_failed", error=str(e), session_id=session_id, exc_info=True)
+            raise e
 
     def __process_messages(self, messages: list[BaseMessage]) -> list[Message]:
+        """Process LangChain messages to API format."""
         openai_style_messages = convert_to_openai_messages(messages)
-        # keep just assistant and user messages
         return [
             Message(**message)
             for message in openai_style_messages
             if message["role"] in ["assistant", "user"] and message["content"]
         ]
-
-    async def clear_chat_history(self, session_id: str) -> None:
-        """Clear all chat history for a given thread ID.
-
-        Args:
-            session_id: The ID of the session to clear history for.
-
-        Raises:
-            Exception: If there's an error clearing the chat history.
-        """
-        try:
-            # Make sure the pool is initialized in the current event loop
-            conn_pool = await self._get_connection_pool()
-
-            # Use a new connection for this specific operation
-            async with conn_pool.connection() as conn:
-                for table in settings.CHECKPOINT_TABLES:
-                    try:
-                        await conn.execute(f"DELETE FROM {table} WHERE thread_id = %s", (session_id,))
-                        logger.info(f"Cleared {table} for session {session_id}")
-                    except Exception as e:
-                        logger.error(f"Error clearing {table}", error=str(e))
-                        raise
-
-        except Exception as e:
-            logger.error("Failed to clear chat history", error=str(e))
-            raise
-
-    async def get_stateless_response(
-        self,
-        messages: list[Message],
-        session_id: Optional[str] = None,
-    ) -> list[dict]:
-        """Get a response from the LLM without using database history.
-        
-        This stateless version doesn't use checkpointing or persistent state,
-        making it ideal for API integrations like OpenSearch where each
-        request should be handled independently.
-        
-        Args:
-            messages (list[Message]): The messages to send to the LLM.
-            session_id (Optional[str]): Optional session ID for tracking only.
-            
-        Returns:
-            list[dict]: The response from the LLM.
-        """
-        # Create a temporary graph for just this request
-        graph_builder = StateGraph(GraphState)
-        graph_builder.add_node("chat", self._chat)
-        graph_builder.add_node("tool_call", self._tool_call)
-        graph_builder.add_conditional_edges(
-            "chat",
-            self._should_continue,
-            {"continue": "tool_call", "end": END},
-        )
-        graph_builder.add_edge("tool_call", "chat")
-        graph_builder.set_entry_point("chat")
-        graph_builder.set_finish_point("chat")
-        
-        # Don't use a checkpointer (no database persistence)
-        graph = graph_builder.compile(
-            checkpointer=None, 
-            name="Stateless Agent"
-        )
-        
-        # Generate a unique session ID if not provided
-        if not session_id:
-            session_id = f"stateless-{uuid.uuid4()}"
-        
-        # Configure without callbacks or checkpointing
-        config = {
-            "configurable": {"thread_id": session_id},
-            "callbacks": [],  # No callbacks for stateless operation
-        }
-        
-        try:
-            response = await graph.ainvoke(
-                {"messages": dump_messages(messages), "session_id": session_id}, 
-                config
-            )
-            return self.__process_messages(response["messages"])
-        except Exception as e:
-            logger.error(f"Error in stateless response: {str(e)}", session_id=session_id)
-            raise e
